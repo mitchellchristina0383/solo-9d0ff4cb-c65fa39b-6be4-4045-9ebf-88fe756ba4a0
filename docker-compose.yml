@@ -1,0 +1,17 @@
+services:
+  alerts:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # 分片 0/1 无延迟，分片 2 每批明细读取 sleep 0.4s，便于演示超时与阻塞分片
+      ALERT_SHARD_DELAYS: "0,0,0.4"
+      ALERT_DEFAULT_TIMEOUT: "5"
+      ALERT_BATCH_SIZE: "20"
+      ALERT_DB_DIR: /data
+    volumes:
+      - alert-data:/data
+    restart: "no"
+
+volumes:
+  alert-data:
