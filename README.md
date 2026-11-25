@@ -17,6 +17,11 @@
 | 确认前 N 条立即返回 | 惰性 k 路归并：只有“全局最大上界”属主缓冲为空时才读批；确认够 N 条立刻返回，较旧分片明细不读 |
 | 读完仍不足 N 返回全部 | 全部分片耗尽返回 `status=exhausted` 和全部可见告警 |
 | 到时补不齐返回最长有序前缀并指出阻塞分片 | `status=timeout`、`complete=false`，`blockers` 给出分片号、阶段（head/batch）、原因、耗时 |
+| **分片巡检：点名分片 + 总时限，录入→新快照分批读回同一条** | `POST /probe/{shard_id}?timeout=`（/docs「分片巡检」分组），走原 `ShardRegistry.append → Shard.append` 链路写 `is_probe=1` 探测行，再开新快照用同款 `read_batch(include_probes=True)` 翻批寻找；只有读回才 `passed=true` |
+| **失败指明卡在录入还是读回** | 响应 `stage`/`stage_label` 为 `append/录入` 或 `readback/读回`，并分别给出 `append` / `readback` 明细与错误 |
+| **到时先返回，超时后才提交也清理** | HTTP 只在总时限内等结论，超时返回 `status=timeout`；后台任务不取消，写锁阻塞导致录入在响应后才提交时，仍在 `finally` 删除探测行；`GET /probe/jobs/{job_id}` 轮询最终结果 |
+| **重启清掉中断遗留探测行** | lifespan 启动先跑 `ProbeManager.cleanup_on_startup()`，`DELETE … WHERE is_probe=1`；`/health.probe_startup_cleanup` 报告各分片删除数 |
+| **正式查询始终排除探测行** | `head` / `count_visible` / `read_batch` 默认全部带 `WHERE is_probe=0`：可见条数、最新排序键、明细都不算探测行；旧库启动自动 `ALTER TABLE ADD COLUMN is_probe … DEFAULT 0` |
 | Docker Compose 启动，/docs 录入查询 | `Dockerfile` + `docker-compose.yml`；启动后访问 `http://localhost:8000/docs` |
 | 样例可给明细读取加延迟 | `ALERT_SHARD_DELAYS="0,0,0.4"`，延迟在 asyncio 层、可被时限即时取消（只加在明细批次，head 不延迟） |
 
@@ -49,13 +54,14 @@ WAL 读快照才会被钉住（已用最小复现和测试验证）。
 ```
 app/
   config.py     # 环境变量配置（分片数、库目录、延迟、批大小、默认时限）
-  shard.py      # SQLite 只追加写入 + 只读快照（head / read_batch）
+  shard.py      # SQLite 只追加写入 + 只读快照（head / read_batch）；is_probe 标记与清理
   merge.py      # 惰性 k 路归并、时限控制、阻塞分片识别
-  models.py     # 请求/响应模型
-  main.py       # FastAPI 路由与生命周期
+  probe.py      # 分片巡检后台任务：录入→新快照分批读回→超时先返回→后台清理→启动清扫
+  models.py     # 请求/响应模型（含 ProbeResponse）
+  main.py       # FastAPI 路由与生命周期（含 /probe、/probe/jobs）
 scripts/
   seed.py       # 幂等样例数据（68 条，含同时间戳决胜与慢分片专属新告警）
-tests/          # 15 个 pytest：合并、分页、快照隔离、超时、API、查询中补报
+tests/          # 28 个 pytest：合并、分页、快照隔离、超时、API、补报、巡检与重启清理
 Dockerfile
 docker-compose.yml
 ```
@@ -92,21 +98,118 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    - `shards[].head_key`：各分片本次可见的最新排序键；
      `shards[].batches_read`：实际读取的明细批次数（head 不计）；
    - `blockers`：超时场景下挡住后续的分片与阶段。
+4. **分片巡检（本次新增）**：/docs 的「分片巡检」分组打开
+   `POST /probe/{shard_id}`，填 `shard_id`（点名分片）和必填的 `timeout`
+   （总时限秒数，也可用 JSON body `{"timeout": …}`），Execute：
+   - `status=passed, passed=true` 才表示“录入 + 新快照分批读回同一条”全部成功，
+     响应通常已带 `cleanup.deleted_rows=1`；
+   - `status=timeout` 时看 `stage`：`append`=卡在录入（典型为分片写锁被占），
+     `readback`=已录入但分批读回在总时限内没完成；`stage_label` 给中文环节名；
+   - 请求到时先返回，后台仍会等迟到的录入提交并删除探测行；用响应里的
+     `status_url`（`GET /probe/jobs/{job_id}`）轮询最终 `append` / `readback` /
+     `cleanup` 结果与 `finished`。
+   - 兼容别名（默认不在 /docs 展示）：`GET/POST /shards/{id}/probe`、
+     `GET/POST /alerts/{id}/probe`、`GET/POST /probe?shard_id=`。
+   - 探测行用 `is_probe=1` 标记、id 带 `probe-` 前缀；正式查询在 SQL 层排除。
 
 ## 5. 自测记录
 
-### 自动化测试（15/15 通过）
+### 自动化测试（28/28 通过，连续 3 轮稳定）
 
 ```
-$ pytest tests/ -q
-15 passed in 7.99s
+$ PYTHONPATH=.pylibs/lib/python3.11/site-packages python3 -m pytest tests/ -q
+28 passed, 1 warning in 9.79s
 ```
 
-覆盖：基本合并与同时间戳 id 决胜、前 N 条早退且旧分片 0 批次、20 条分页、
-跨分页交错归并、空分片、head/batch 两阶段超时、部分有序前缀 + 阻塞分片、
-慢但未超时成功、SQLite 快照隔离、查询中补报不可见、API 参数校验与 409 冲突。
+原 15 个测试全部保持通过；新增 13 个巡检测试：
 
-### 真实 HTTP 实测（uvicorn + 种子数据，分片 2 延迟 0.4s/批）
+- 巡检 happy path：passed、读回批次≥1、`cleanup.deleted_rows=1`、库内无探测行；
+- 路径/方法/body 兼容别名（`/alerts/{id}/probe`、`GET /probe/{id}`、
+  `/probe?shard_id=`、JSON `{"timeout":…}`）；404 分片、422 缺总时限；
+- 正式快照的 `count_visible` / `head` / `read_batch` 排除探测行，
+  `include_probes=True` 仍可见；正式 `/alerts/latest` 的明细、`visible_rows`、
+  `head_key` 均不含探测行；
+- 探测行落在 25 条更新数据之后时，`include_probes` 分批翻 ≥2 批仍能读回；
+- 读回超时：`stage=readback`、录入成功、后台清理删除 1 行；
+- 进程内 asyncio 写锁阻塞：持锁期间总时限到，返回 append 超时且探测行未提交；
+  放锁后“超时后才提交”，任务最终 `append_ok=true` 且清理 1 行；
+- 真实 SQLite 跨连接 `BEGIN IMMEDIATE` 写事务阻塞录入（端到端 HTTP）；
+- 启动清理删除三分片遗留探测行、保留正式行（服务级 + 完整 lifespan 两组）。
+
+> 联调中发现并修复一个真实竞态：读回延迟最初写成
+> `wait_for(sleep(delay), timeout=min(delay, remaining))`，预算充足时
+> `timeout` 恰好等于 `delay`，`wait_for` 与 `sleep` 同时到期会抛
+> `TimeoutError`，使“慢但健康”的分片在一批延迟后被误判读回超时（全量测试
+> 按文件序跑到带 0.15s 延迟的分片 2 时复现）。改为与 `merge.py` 一致地用
+> “剩余总预算”作为 `wait_for` 超时后，慢分片 happy path 与紧时限超时均正确。
+
+### 巡检三项规定动作的真实 HTTP 实测（uvicorn，环境变量同 compose：`0,0,0.4`）
+
+**① 写锁阻塞（跨进程 SQLite 写事务，分片 0，持有 4s，总时限 1s）**
+
+```
+[holder] BEGIN IMMEDIATE ... hold 4.0s
+[client] POST /probe returned after 1.01s (budget 1.0s)
+  status=timeout  stage=append(录入)  phase=append  in_progress=true
+  append.ok(响应时)=null        # 录入仍堵在 SQLite 写锁上
+[holder] ROLLBACK / write lock released
+[job] final status=timeout stage=append finished=true caller_timed_out=true
+      append_ok=true append_elapsed_ms=4035.0      # 超时响应之后才拿到锁并提交
+      cleanup_done=true cleanup_deleted_rows=1
+[db] probe_rows=0 formal_rows=0
+DRILL_RESULT: PASS
+```
+
+**② 读回超时（分片 2 每批延迟 0.4s，总时限 0.1s）**
+
+```
+[client] POST returned after 0.11s
+  status=timeout stage=readback(读回) append.ok=true elapsed_ms=100
+  detail=总时限 0.1s 到时，巡检仍卡在【读回】阶段 ...
+[job] final finished=true readback_ok=false
+      error=到达总时限，第 1 批明细仍在延迟/读取
+      cleanup_deleted_rows=1
+DRILL_RESULT: PASS
+```
+
+对照：同一慢分片 2 把总时限放宽到 5s 时 `status=passed`，耗时 406ms
+（恰好一批延迟），读回 1 批、清理删除 1 行——证明上面的超时是预算生效而非误判。
+
+**③ 中断后重启（kill -9 + 遗留行）**
+
+```
+[kill] observed committed probe row probe-3e54...; SIGKILL pid 872
+[kill] server process is dead
+[kill] after SIGKILL probe_rows=1, killed probe row still on disk=True
+```
+
+另向分片 0/1 各插 1 行 `is_probe=1` 模拟任意中断遗留；此时三分片各 1 条探测行。
+用同一 `/data` 目录重新启动：
+
+```
+GET /health -> {"probe_startup_cleanup":{"0":1,"1":1,"2":1}, ...}
+startup removed leftover probe rows: {0: 1, 1: 1, 2: 1}
+重启后库内 ALL PROBE ROWS: 0     # 正式行原样保留
+重启后 POST /probe/1?timeout=5 -> passed=True, cleanup=1
+```
+
+**正式查询排除探测行的实测**：向分片 1 物理插入最新探测行
+`ts=4200000001 / probe-exclusion-check`，再录一条较旧正式行
+`ts=4100000000 / normal-exclusion-check`：
+
+```
+GET /alerts/latest -> 明细不含 probe-exclusion-check，含 normal-exclusion-check
+shard 1 stat: visible_rows=1
+              head_key=[4100000000.0, "normal-exclusion-check"]
+库原始计数: shard 1 formal=1 probe=1 total_raw=2   # 行确实在，只是正式查询不可见
+```
+
+**旧库迁移实测**：手工建 v1 五列旧表 + 2 条历史行，`Shard(0)` 初始化后
+自动补出 `is_probe` 列（默认 0），`count_visible=2`、`head=(1001,'old-2')`、
+明细分页正常，`delete_all_probes()=0`。`/docs` 返回 200，OpenAPI 中
+`/probe/{shard_id}` 的 `shard_id` 必填、`timeout` 参数可见。
+
+### 原有真实 HTTP 实测（uvicorn + 种子数据，分片 2 延迟 0.4s/批）
 
 - `n=5,timeout=5`：5 条全部来自分片 2，分片 0/1 `batches_read=0`，
   分片 2 仅 1 批，耗时约 0.4s（一批延迟）。
@@ -123,9 +226,13 @@ $ pytest tests/ -q
 
 ## 6. 未完成项 / 限制
 
-1. **本环境没有 Docker 守护进程**，`docker compose up --build` 未在本机实跑；
-   Dockerfile/compose 已按标准 Python 3.11-slim 镜像编写，需在有 Docker 的
-   环境验证一次。
+1. **本环境没有 Docker 守护进程**（`docker: command not found`、无
+   `/var/run/docker.sock`），`docker compose up --build` 未在本机实跑；
+   已用 PyYAML 校验 `docker-compose.yml` 语法，并按 compose 中的环境变量
+   （`ALERT_SHARD_DELAYS=0,0,0.4`、`ALERT_BATCH_SIZE=20`、独立 `ALERT_DB_DIR`）
+   用 `.pylibs` 里的依赖直接起 uvicorn 完成全部实测。`Dockerfile` 用
+   `COPY app ./app` 整目录拷贝，新增的 `app/probe.py` 会自动进镜像；
+   compose 无需改动。仍需在有 Docker 的环境真实 `up --build` 一次。
 2. 阻塞分片目前报告“全局最大上界属主”这一直接阻塞者；若需要把所有在途未返回
    的分片都列出，可在后续版本扩展（协议上属主才是有序前缀的硬阻塞）。
 3. 人工延迟是演示用的同步等待模拟，真实分片应替换为网络/远程 DB 客户端；
@@ -133,3 +240,12 @@ $ pytest tests/ -q
 4. 未做鉴权与多租户隔离，按内部运维工具假设部署在可信网络。
 5. 测试使用 FastAPI `TestClient`（基于 httpx 的同步封装，有一条 starlette
    弃用告警，不影响功能）。
+6. 巡检任务表 `ProbeManager.jobs` 是**进程内内存态**，与 compose 的单 uvicorn
+   worker 对应；多 worker / 多副本部署时 `GET /probe/jobs/{id}` 可能落到没有该
+   任务的进程。核心安全性不依赖该表：探测行有 `is_probe=1` 标记，任何进程重启
+   都会在启动时清扫，后台清理也在录入所在进程内完成。后续若水平扩展，可把任务
+   状态落到 SQLite/Redis，并给 jobs 表加 TTL/条数上限（当前不主动淘汰）。
+7. SQLite 写等待受连接 `busy_timeout=30s` 约束：若第三方写事务持锁超过 30s，
+   探测录入会收到 `OperationalError` 并判为 `failed/stage=append`；残留行仍由
+   清理重试与下次启动清扫兜底。直接用 SQL 排查库时，正式数据请带
+   `WHERE is_probe=0`（或依赖启动清扫后的干净状态）。

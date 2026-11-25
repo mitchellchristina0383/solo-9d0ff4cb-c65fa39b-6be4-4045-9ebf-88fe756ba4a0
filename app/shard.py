@@ -21,10 +21,14 @@ CREATE TABLE IF NOT EXISTS alerts (
     timestamp REAL NOT NULL,
     level TEXT NOT NULL,
     source TEXT NOT NULL,
-    message TEXT NOT NULL
+    message TEXT NOT NULL,
+    is_probe INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_ts_id ON alerts(timestamp DESC, id DESC);
 """
+
+# 探测告警编号统一前缀，便于人工识别 / 应急清理；正式过滤以 is_probe 列为准
+PROBE_ID_PREFIX = "probe-"
 
 
 def db_path(shard_id: int) -> str:
@@ -50,14 +54,49 @@ class Shard:
         self._write_conn = _connect(self.path)
         self._write_conn.executescript(SCHEMA)
         self._write_conn.commit()
+        self._migrate()
 
-    def append(self, alert_id: str, timestamp: float, level: str, source: str, message: str) -> None:
-        # 只追加：INSERT 冲突直接抛错，不做更新
+    def _migrate(self) -> None:
+        """旧版本库没有 is_probe 列时在线补列（历史行全部视为正式告警）。"""
+        cols = [r[1] for r in self._write_conn.execute("PRAGMA table_info(alerts)")]
+        if "is_probe" not in cols:
+            self._write_conn.execute(
+                "ALTER TABLE alerts ADD COLUMN is_probe INTEGER NOT NULL DEFAULT 0"
+            )
+            self._write_conn.commit()
+
+    def append(
+        self,
+        alert_id: str,
+        timestamp: float,
+        level: str,
+        source: str,
+        message: str,
+        *,
+        is_probe: bool = False,
+    ) -> None:
+        # 只追加：INSERT 冲突直接抛错，不做更新。
+        # 巡检探测行走的是同一条录入链路，仅 is_probe 标记不同。
         self._write_conn.execute(
-            "INSERT INTO alerts (id, timestamp, level, source, message) VALUES (?, ?, ?, ?, ?)",
-            (alert_id, timestamp, level, source, message),
+            "INSERT INTO alerts (id, timestamp, level, source, message, is_probe) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (alert_id, timestamp, level, source, message, 1 if is_probe else 0),
         )
         self._write_conn.commit()
+
+    def delete_probe(self, alert_id: str) -> int:
+        """删除指定探测行（巡检结束后的清理；只允许删 is_probe=1 的行）。"""
+        cur = self._write_conn.execute(
+            "DELETE FROM alerts WHERE id = ? AND is_probe = 1", (alert_id,)
+        )
+        self._write_conn.commit()
+        return int(cur.rowcount or 0)
+
+    def delete_all_probes(self) -> int:
+        """清掉全部探测行；启动时用于清理中断遗留。"""
+        cur = self._write_conn.execute("DELETE FROM alerts WHERE is_probe = 1")
+        self._write_conn.commit()
+        return int(cur.rowcount or 0)
 
     def open_snapshot(self) -> "ShardSnapshot":
         return ShardSnapshot(self.shard_id, self.path)
@@ -91,42 +130,54 @@ class ShardSnapshot:
         self._closed = False
 
     def head(self) -> tuple[float, str] | None:
-        """本分片当前可见的最新排序键；空库返回 None。"""
+        """本分片当前可见的最新排序键；空库（或仅含探测行）返回 None。
+
+        正式查询始终排除 is_probe=1 的巡检探测行。
+        """
         row = self._conn.execute(
-            "SELECT timestamp, id FROM alerts ORDER BY timestamp DESC, id DESC LIMIT 1"
+            "SELECT timestamp, id FROM alerts WHERE is_probe = 0 "
+            "ORDER BY timestamp DESC, id DESC LIMIT 1"
         ).fetchone()
         if row is None:
             return None
         return float(row["timestamp"]), str(row["id"])
 
     def count_visible(self) -> int:
-        return int(self._conn.execute("SELECT COUNT(*) AS c FROM alerts").fetchone()["c"])
+        # 可见条数同样不能把探测行算进去
+        return int(
+            self._conn.execute(
+                "SELECT COUNT(*) AS c FROM alerts WHERE is_probe = 0"
+            ).fetchone()["c"]
+        )
 
     def read_batch(
-        self, cursor: tuple[float, str] | None
+        self, cursor: tuple[float, str] | None, *, include_probes: bool = False
     ) -> Batch:
         """读取一批明细（最多 20 条），按 (timestamp, id) 倒序。
 
         cursor 为上一批最后一条的排序键；None 表示从头读。
-        人为延迟不在这里 sleep，而由 merge 引擎按 delay_seconds 异步等待，
+        正式合并查询默认 include_probes=False，排除探测行；巡检读回自己的
+        探测行时传 include_probes=True，分页/游标逻辑完全复用。
+        人为延迟不在这里 sleep，而由调用方按 delay_seconds 异步等待，
         以便查询时限到点时立即取消（head() 不延迟）。
         """
-        if cursor is None:
-            sql = (
-                "SELECT id, timestamp, level, source, message FROM alerts "
-                "ORDER BY timestamp DESC, id DESC LIMIT ?"
-            )
-            params: tuple[Any, ...] = (settings.batch_size,)
-        else:
+        predicates: list[str] = []
+        params: list[Any] = []
+        if not include_probes:
+            predicates.append("is_probe = 0")
+        if cursor is not None:
             # 行值比较：严格排在 cursor 之前的下一批
-            sql = (
-                "SELECT id, timestamp, level, source, message FROM alerts "
-                "WHERE (timestamp, id) < (?, ?) "
-                "ORDER BY timestamp DESC, id DESC LIMIT ?"
-            )
-            params = (cursor[0], cursor[1], settings.batch_size)
+            predicates.append("(timestamp, id) < (?, ?)")
+            params.extend([cursor[0], cursor[1]])
 
-        raw = self._conn.execute(sql, params).fetchall()
+        where = (" WHERE " + " AND ".join(predicates)) if predicates else ""
+        sql = (
+            "SELECT id, timestamp, level, source, message FROM alerts"
+            f"{where} ORDER BY timestamp DESC, id DESC LIMIT ?"
+        )
+        params.append(settings.batch_size)
+
+        raw = self._conn.execute(sql, tuple(params)).fetchall()
         self.batches_read += 1
         rows = [dict(r) for r in raw]
         more = len(rows) == settings.batch_size
